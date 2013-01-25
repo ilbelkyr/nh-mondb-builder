@@ -1,0 +1,79 @@
+#!/usr/bin/env perl
+use 5.012;
+use strict;
+use warnings;
+
+use lib './lib';
+use Local::MonDB::Schema;
+use Storable qw<retrieve_fd>;
+
+# this is rather ugly... but it works
+
+my $connstr = shift;
+if (!defined $connstr) {
+    die 'Need a DBI connection string as argument';
+}
+
+my $db = Local::MonDB::Schema->connect($connstr);
+
+# Load monster data from STDIN.
+my $d = retrieve_fd(\*STDIN);
+my $rs = $db->resultset('Monster');
+
+my @rows;
+
+# Now, iterate over the monsters, adding them to @rows.
+while (my ($name, $m) = each %$d) {
+    my @attacks;
+    my $n = 0;
+    # Get the attacks into hash format, as expected by DBIC
+    for my $atk (@{$$m{attacks}}) {
+        push @attacks, {
+            sort_index => $n++,
+            at => $$atk[0],
+            ad => $$atk[1],
+            dn => $$atk[2],
+            ds => $$atk[3],
+        };
+    }
+    # Flags, mostly as above.
+    my @flags;
+    for my $flg (
+        @{$$m{flags1}},
+        @{$$m{flags2}},
+        @{$$m{flags3}},
+        @{$$m{gflags}},
+        @{$$m{resist}},
+    ) {
+        push @flags, {
+            name => $flg,
+        };
+    }
+    # Conferred resistances.
+    for my $flg (@{$$m{confer}}) {
+        push @flags, {
+            name => "confers_$flg",
+        };
+    }
+    # Add the row as hashref.
+    push @rows, {
+            name => $name,
+            ac => $$m{ac},
+            align => $$m{align},
+            baselev => $$m{baselev},
+            color => $$m{color},
+            frequency => $$m{frequency},
+            glyph => $$m{glyph},
+            mr => $$m{mr},
+            nutrition => $$m{nutr},
+            pxl => $$m{pxl},
+            size => $$m{size},
+            sound => $$m{sound},
+            speed => $$m{speed},
+            weight => $$m{weight},
+            attacks => \@attacks,
+            flags => \@flags,
+    };
+}
+
+$rs->populate(\@rows);

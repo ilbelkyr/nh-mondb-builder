@@ -1,0 +1,456 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use 5.012;
+use autodie;
+
+use Getopt::Long qw<GetOptions>;
+use Pod::Usage qw<pod2usage>;
+use Storable qw<nstore_fd>;
+use Scalar::Util qw<looks_like_number>;
+
+# this is also really ugly, but it works.
+# outputs a Storable file in network order,
+# uses regexes to "parse" monst.c
+
+=head1 NAME
+
+parse_monst - a "parser" for NetHack's monst.c
+
+=head1 VERSION
+
+0.1
+
+=head1 DESCRIPTION
+
+This script reads NetHack's monst.c and writes monster data
+to an output file (or standard output).
+
+=head1 USAGE
+
+ ./parse_monst.pl [-D CHARON=1 [-D TOURIST=0 [...]]]
+                  --monst=/path/to/monst.c [--hash]
+                  -o /path/to/output/file
+ ./parse_monst.pl --help
+
+=head1 OPTIONS
+
+=over
+
+=item --monst | -m
+
+Where to find monst.c
+
+This is a required option.
+
+=item -o
+
+Output file
+
+If unspecified, output is sent to standard output.
+
+=item --define | -D
+
+Specify a #define macro in the format "NAME=value". Defining
+a macro to a non-true value will make this program consider it
+to be #undef'ed.
+
+=item --hash
+
+Don't store data based on the positional order used in the NetHack
+source; use a field name -> field value mapping instead.
+
+=back
+
+=head1 UNSAFE OPTIONS
+
+There is a group of "unsafe options" which allows you to
+specify regexes which will be used to parse F<monst.c>.
+While these options might be useful in some cases (for
+example when working with a variant that modified the
+format of monst.c), allowing untrusted users to specify
+arbitrary regexes to use might be a potential security risk.
+
+Additionally, most of these options are probably useless
+without knowledge about how the script reads F<monst.c>.
+
+For these reasons, the "unsafe" options are disabled by
+default; you can enable them by setting C<$allow_unsafe_opts>
+to a true value.
+
+=cut
+
+my $o_monst;
+my $o_help;
+my $o_output;
+my $o_format;
+my $o_hash;
+my %o_define;
+
+my %options = (
+    'help|h'     => sub { pod2usage(0) },
+    'monst|m=s'  => \$o_monst,
+    'define|D=s' => \%o_define,
+    'output|o=s' => \$o_output,
+    'format|f=s' => \$o_format,
+    'hash'       => \$o_hash,
+);
+
+# NOTE: These options are disabled by default. See the POD.
+my $allow_unsafe_opts = 0;
+
+my $o_begin;
+my $o_end;
+my $o_parser;
+
+my %unsafe_options = (
+    'begin=s'    => \$o_begin,
+    'end=s'      => \$o_end,
+    'parser=s'   => \$o_parser,
+);
+
+if (!$allow_unsafe_opts) {
+    for my $k (keys %unsafe_options) {
+        $unsafe_options{$k} = sub {
+            say "Unsafe options have been disabled.";
+            exit 1;
+        };
+    }
+}
+
+GetOptions(%options, %unsafe_options) or pod2usage(1);
+
+if (!defined $o_monst) {
+    pod2usage(1);
+}
+
+sub numify {
+    my $value = shift;
+    return (looks_like_number($value) ? $value+0 : $value);
+}
+
+my %ifdef = ( # Stores #define macros. Currently 0 = not defined
+    # Defaults
+    CHARON  => 0,
+    KOPS    => 1,
+    SEDUCE  => 1,
+    MAIL    => 1,
+    TOURIST => 1,
+    %o_define, # This can override the default values.
+);
+
+my @monsters;
+
+my $begin = ($o_begin // qr/mons\[\] =/);
+my $end   = ($o_end   // qr/array terminator/);
+
+my @mon_fields = qw<name glyph baselev speed ac mr align
+gflags attacks weight nutr pxl sound size resist
+confer flags1 flags2 flags3 color
+
+frequency>;
+#my @numeric_mon_fields = qw<baselev speed ac mr weight
+#nutr>;
+# To easily get a field's position in @mon_fields.
+my %mon_fields;
+@mon_fields{@mon_fields} = 0 .. $#mon_fields;
+
+# TODO: automatic color detection
+my @colors = qw<CLR_BLACK CLR_RED CLR_GREEN
+CLR_BROWN CLR_BLUE CLR_MAGENTA CLR_CYAN CLR_GRAY NO_COLOR
+CLR_ORANGE CLR_BRIGHT_GREEN CLR_YELLOW CLR_BRIGHT_BLUE
+CLR_BRIGHT_MAGENTA CLR_BRIGHT_CYAN CLR_WHITE>;
+
+my %colors;
+@colors{@colors} = 0 .. $#colors;
+$colors{HI_OBJ}        = $colors{CLR_MAGENTA};
+$colors{HI_METAL}      = $colors{CLR_CYAN};
+$colors{HI_COPPER}     = $colors{CLR_YELLOW};
+$colors{HI_SILVER}     = $colors{CLR_GRAY};
+$colors{HI_GOLD}       = $colors{CLR_YELLOW};
+$colors{HI_LEATHER}    = $colors{CLR_BROWN};
+$colors{HI_CLOTH}      = $colors{CLR_BROWN};
+$colors{HI_ORGANIC}    = $colors{CLR_BROWN};
+$colors{HI_WOOD}       = $colors{CLR_BROWN};
+$colors{HI_PAPER}      = $colors{CLR_WHITE};
+$colors{HI_GLASS}      = $colors{CLR_BRIGHT_CYAN};
+$colors{HI_MINERAL}    = $colors{CLR_GRAY};
+$colors{DRAGON_SILVER} = $colors{CLR_BRIGHT_CYAN};
+$colors{HI_ZAP}        = $colors{CLR_BRIGHT_BLUE};
+$colors{HI_DOMESTIC}   = $colors{CLR_WHITE};
+$colors{HI_LORD}       = $colors{CLR_MAGENTA};
+
+# AceHack, NetHack4
+$colors{MG_ULINE}     = $colors{HI_ULINE} = 0x20;
+$colors{HI_QUEST}     = $colors{CLR_BRIGHT_MAGENTA};
+$colors{HI_DOMESTIC1} = $colors{CLR_GRAY};
+$colors{HI_DOMESTIC2} = $colors{CLR_WHITE};
+$colors{HI_DOMESTIC3} = $colors{CLR_WHITE} | $colors{HI_ULINE};
+$colors{HI_GUARDIAN}  = $colors{CLR_GRAY}  | $colors{HI_ULINE};
+
+# constant things
+my %weight = (
+    WT_ELF    => 800,
+    WT_DRAGON => 4500,
+    WT_HUMAN  => 1450,
+);
+
+my @gflags = qw<G_NOCORPSE G_GENO G_LGROUP G_SGROUP G_NOGEN
+G_HELL G_NOHELL G_UNIQ>;
+my %gflags;
+@gflags{@gflags} = 0 .. $#gflags;
+
+my %glyph_map = (
+    S_ANT       => 'a', S_BLOB       => 'b', S_COCKATRICE => 'c',
+    S_DOG       => 'd', S_EYE        => 'e', S_FELINE     => 'f',
+    S_GREMLIN   => 'g', S_HUMANOID   => 'h', S_IMP        => 'i',
+    S_JELLY     => 'j', S_KOBOLD     => 'k', S_LEPRECHAUN => 'l',
+    S_MIMIC     => 'm', S_NYMPH      => 'n', S_ORC        => 'o',
+    S_PIERCER   => 'p', S_QUADRUPED  => 'q', S_RODENT     => 'r',
+    S_SPIDER    => 's', S_TRAPPER    => 't', S_UNICORN    => 'u',
+    S_VORTEX    => 'v', S_WORM       => 'w', S_XAN        => 'x',
+    S_LIGHT     => 'y', S_ZRUTY      => 'z', S_ANGEL      => 'A',
+    S_BAT       => 'B', S_CENTAUR    => 'C', S_DRAGON     => 'D',
+    S_ELEMENTAL => 'E', S_FUNGUS     => 'F', S_GNOME      => 'G',
+    S_GIANT     => 'H', S_JABBERWOCK => 'J', S_KOP        => 'K',
+    S_LICH      => 'L', S_MUMMY      => 'M', S_NAGA       => 'N',
+    S_OGRE      => 'O', S_PUDDING    => 'P', S_QUANTMECH  => 'Q',
+    S_RUSTMONST => 'R', S_SNAKE      => 'S', S_TROLL      => 'T',
+    S_UMBER     => 'U', S_VAMPIRE    => 'V', S_WRAITH     => 'W',
+    S_XORN      => 'X', S_YETI       => 'Y', S_ZOMBIE     => 'Z',
+    S_HUMAN     => '@', S_GHOST      => ' ', S_GOLEM      => "'",
+    S_DEMON     => '&', S_EEL        => ';', S_LIZARD     => ':',
+    S_INVISIBLE => 'I', S_WORM_TAIL  => '~', S_MIMIC_DEF  => ']',
+);
+
+# you will hate me for this
+my $mon_re = qr<
+  MON\( \s* # the "top"
+    "(?<name>[^"]+)"     \s*, \s* # monster name
+    (?<glyph>\w+)        \s*, \s* # glyph/symbol
+    LVL\( \s*
+      (?<baselev>(?&INT))\s*, \s* # base level
+      (?<speed>(?&INT))  \s*, \s* # speed
+      (?<ac>(?&INT))     \s*, \s* # base AC
+      (?<mr>(?&INT))     \s*, \s* # monster MR
+      (?<align>(?&INT))  \s*      # monster alignment
+    \)                   \s*, \s*
+    (?<gflags>(?&F))     \s*, \s* # generation flags
+    A\((?<attacks>
+    \s*(?&A)(?:\s*,\s*(?&A)){5}   # attacks
+    \s*)\)               \s*, \s*
+    SIZ\( \s*
+      (?<weight>(?&INT)) \s*, \s* # weight
+      (?<nutr>(?&INT))   \s*, \s* # nutrition
+      (?<pxl>[^,]+)      \s*, \s* # extension length
+      (?<sound>(?&INT))  \s*, \s* # sound
+      (?<size>(?&INT))   \s*      # size
+    \)\s*, \s*
+    (?<resist>(?&F))     \s*, \s* # resistances
+    (?<confer>(?&F))     \s*, \s* # resistances conferred
+    (?<flags1>(?&F))     \s*, \s* # monster flags 1
+    (?<flags2>(?&F))     \s*, \s* # monster flags 2
+    (?<flags3>(?&F))     \s*, \s* # monster flags 3
+    (?<color>(?&F))      \s*      # color; flag group because of Ace/NH4
+  \)
+
+  (?(DEFINE)
+    (?<INT>[-0-9A-Z_]+)      # integer; A-Z for #define's
+    (?<G>\w+)                # a flag
+    (?<GM>(?&G)(?:           # multiple flags
+            \s*\|\s*(?&G))*)
+    (?<A>ATTK\(\s*\w+\s*,    # an attack - attack type,
+               \s*\w+\s*,                # damage type,
+               \s*\d+\s*,                # number of dice,
+               \s*\d+\s*\)               #  sides of dice
+        |NO_ATTK             # (or no attack)
+    )
+    (?<F>\((?&GM)\)|(?&GM))  # flag group
+  )
+>xms;
+
+my $ifdef_skip = 0; # Depth of skip-causing #ifdef's (also used for #if 0)
+my @ifdefs; # keeps track of ifdef-endif
+
+open(my $monst_c, '<', $o_monst);
+
+line: while (my $line = <$monst_c>) {
+    chomp $line;
+    next unless $line =~ $begin .. $line =~ $end;
+
+    # We don't really try to seriously parse monst.c;
+    # instead we hope noone changed the "typical"
+    # format of MON() entries. This might need changes
+    # to work with variants.
+
+    # Skip the first line.
+    state $first_line_skipped = 0;
+    next unless $first_line_skipped++;
+
+    if ($line =~ /\\$/) { # line continuations - not perfect
+        $line =~ s/\\$//;
+        $line .= <$monst_c>;
+        redo line;
+    }
+
+    # Remove comments
+    if ($line =~ m-/\*-ms) {
+        if ($line !~ m-\*/-ms) {
+            $line .= <$monst_c>; # Comment doesn't end here -
+            redo line;           # include the next line
+        }
+        $line =~ s-/\*.*?\*/--g; # Non-greedy so "/* */ */" becomes " */"
+    }
+
+    # Preprocessor conditionals.
+    # Does *not* consider #elif and any #if construct except for
+    # #if 0 (because monst.c does not use these constructs).
+    if ($line =~ /#\s*if(n?)def\s+(\w+)/) {
+        if (!$ifdef{$2} xor $1) {
+            push @ifdefs, 1;
+            $ifdef_skip++;
+        }
+        else {
+            push @ifdefs, 0;
+        }
+        next;
+    }
+    elsif ($line =~ /#\s*if\s+0/) {
+        $ifdef_skip++;
+        push @ifdefs, 1;
+        next;
+    }
+    elsif ($line =~ /#\s*else/) {
+        if (pop @ifdefs) {
+            $ifdef_skip--;
+            push @ifdefs, 0;
+        }
+        else {
+            $ifdef_skip++;
+            push @ifdefs, 1;
+        }
+        next;
+    }
+    elsif ($line =~ /#\s*endif/) {
+        if (pop @ifdefs) { # If it ended a skip-causing block,
+            $ifdef_skip--; # decrement the number of skip-causing blocks
+        }
+        next;
+    }
+    elsif ($line =~ /#\s*define\s+(\w+)(?:\s++(.+))?/) {
+        $ifdef{$1} = ($2 // 1) unless $ifdef_skip;
+        next;
+    }
+    elsif ($line =~ /#\s*undef\s+(\w+)/) {
+        delete $ifdef{$1} unless $ifdef_skip;
+        next;
+    }
+    elsif ($line =~ /^\s*#\s*(\w+)/) {
+        die "Unsupported preprocessor directive \"#$1\"";
+    }
+
+    next if $ifdef_skip;
+    next if $line =~ /^\s*$/ms; # skip whitespace-only lines
+
+    # Now only the MON() lines are left.
+    while ($line !~ $mon_re) { # Make sure we have one entry per "line"
+        $line .= <$monst_c>;
+        # Also replace this #define - don't check every #define
+        $line =~ s/SEDUCTION_ATTACKS/$ifdef{SEDUCTION_ATTACKS}/g;
+        # Well, and this one...
+        $line =~ s/A_NONE/-128/g;
+        redo line;
+    }
+
+    # Now $line is one MON() definition
+    $line =~ $mon_re;
+    push @monsters, [@+{@mon_fields}];
+
+    # special flag group treatment, so they're actually turned into
+    # a list of flags.
+    KEY: for my $key (qw<gflags resist confer flags1 flags2 flags3>) {
+        my $num = $mon_fields{$key};
+        if (!$monsters[$#monsters][$num]) {
+            #undef $monsters[$#monsters][$num];
+            $monsters[$#monsters][$num] = [];
+            next KEY;
+        }
+        $monsters[$#monsters][$num] =~ s/[)(]|\s+//g;
+        $monsters[$#monsters][$num] = [split /\|/, $monsters[$#monsters][$num]];
+
+        # Find the frequency by filtering for the number.
+        # If there is none, use 0.
+        if ($key eq 'gflags') {
+            $monsters[$#monsters][$mon_fields{frequency}] =
+                (grep {looks_like_number $_}
+                    @{$monsters[$#monsters][$num]})[0] // 0;
+        }
+    }
+    #my $gflags = $monsters[$#monsters][$mon_fields{gflags}];
+    #my $tmp = 0;
+    #for (@$gflags) {
+    #if (exists $gflags{$_}) {
+    #$tmp |= ($gflags{$_} << 1);
+    #}
+    #else {
+    #$tmp |= $_;
+    #}
+    #}
+    #$monsters[$#monsters][$mon_fields{gflags}] = $tmp;
+    $monsters[$#monsters][$mon_fields{glyph}] =~ s/(\w+)/$glyph_map{$1}/;
+    #$monsters[$#monsters][$mon_fields{color}] =~ s/(\w+)/$colors{$1}/;
+    $monsters[$#monsters][$mon_fields{weight}] =~
+        s/(\w+)/(exists $weight{$1}) ? $weight{$1} : $1/e;
+
+    # numify
+    #$monsters[$#monsters][$mon_fields{weight}] += 0;
+    for my $field (@{$monsters[$#monsters]}) {
+        # If it looks like a number, make sure it's considered
+        # a number. Or something like that. Used to make a minor
+        # difference when this used some other output format?
+        $field = numify($field);
+    }
+
+    # Attacks.
+    my $attk = $monsters[$#monsters][$mon_fields{attacks}];
+    my @attacks;
+    my $attk_re = qr/ATTK\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/;
+    while ($attk =~ s/$attk_re//) {
+        push @attacks, [$1, $2, 0+$3, 0+$4];
+    }
+    $monsters[$#monsters][$mon_fields{attacks}] = \@attacks;
+}
+
+# Phew. Now, to actually output this.
+
+my $outfile;
+if (defined $o_output) {
+    open($outfile, '>', $o_output)
+}
+else {
+    $outfile = *STDOUT;
+}
+
+if ($o_hash) {
+    # turn it into a hash (recommended). this basically maps each
+    # monster to a hash-based representation of itself.
+    @monsters = map {
+        my $tmp;
+        for my $k (0 .. $#$_) {
+            $$tmp{$mon_fields[$k]} = $$_[$k];
+        }
+        $tmp
+    } @monsters;
+
+    # ...and this puts them into a hash with their name as key,
+    # and deletes their name entry.
+    my %mon_hash;
+    @mon_hash{map {$$_{name}} @monsters} = @monsters;
+    for my $k (keys %mon_hash) { delete $mon_hash{$k}{name} }
+    nstore_fd(\%mon_hash, $outfile);
+}
+else {
+    nstore_fd(\@monsters, $outfile);
+}
+
+close $outfile;
