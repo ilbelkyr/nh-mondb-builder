@@ -1,3 +1,18 @@
+## this is old and broken
+
+I wrote this years ago, it uses some really ugly regex
+instead of something proper that'd be much easier, and
+it hasn't been tested against recent NetHack code
+(and almost certainly doesn't work anymore).
+
+I've kept it up for the morbidly curious, but there's
+no reason anyone should use this.
+
+Having said that, I've also preserved the former README
+below for the sake of completeness.
+
+------------------------------------------------------------
+
 ## Warning:
 
 **tl;dr: Don't use this unless you have no other choice.**
